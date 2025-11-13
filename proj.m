@@ -26,28 +26,26 @@ fprintf('Total image-mask pairs: %d\n', numel(imagePaths));
 img = imread(imagePaths{1}); % imshow(img);
 fprintf('Image dimensions: %d x %d x %d\n', size(img, 1), size(img, 2), size(img, 3));
 
-%% 2. Split Dataset
+%% Split into train/val/test (70/15/15) - PATIENT-WISE to avoid data leakage
+fprintf('Performing patient-wise split to avoid data leakage...\n');
 
-% Split into train/validation/test (70%/15%/15%)
-N = numel(imagePaths);
-rng(42); % For reproducibility
-idx = randperm(N);
+% Use patient-wise split function
+[trainIdx, valIdx, testIdx] = patientWiseSplit(imagePaths, 0.70, 0.15);
 
-trainEnd = floor(0.7 * N);
-valEnd = floor(0.85 * N);
+% Create split lists
+trainImgList = imagePaths(trainIdx);
+trainMaskList = maskPaths(trainIdx);
+valImgList = imagePaths(valIdx);
+valMaskList = maskPaths(valIdx);
+testImgList = imagePaths(testIdx);
+testMaskList = maskPaths(testIdx);
 
-trainIdx = idx(1:trainEnd);
-valIdx = idx(trainEnd+1:valEnd);
-testIdx = idx(valEnd+1:end);
+fprintf('Patient-wise split complete.\n');
 
-trainImages = imagePaths(trainIdx); trainMasks = maskPaths(trainIdx);
-valImages = imagePaths(valIdx); valMasks = maskPaths(valIdx);
-testImages = imagePaths(testIdx); testMasks = maskPaths(testIdx);
-
-fprintf('Train: %d, Validation: %d, Test: %d\n', length(trainImages), length(valImages), length(testImages));
+fprintf('Train: %d, Validation: %d, Test: %d\n', length(trainImgList), length(valImgList), length(testImgList));
 
 %Save split 
-save('dataset_split.mat', 'trainImages', 'trainMasks','valImages', 'valMasks', 'testImages', 'testMasks');
+save('dataset_split.mat', 'trainImgList', 'trainMaskList', 'valImgList', 'valMaskList', 'testImgList', 'testMaskList');
 
 %% Clean & Preprocess Data (normalization, resizing, masking)
 % - FLAIR ONLY (channel 2)
@@ -58,9 +56,10 @@ save('dataset_split.mat', 'trainImages', 'trainMasks','valImages', 'valMasks', '
 IMG_SIZE = 256;
 
 USE_3CH = true;
-[X_train, y_train] = loadSet(trainImages, trainMasks, IMG_SIZE, USE_3CH);
-[X_val,   y_val  ] = loadSet(valImages,   valMasks,   IMG_SIZE, USE_3CH);
-[X_test,  y_test ] = loadSet(testImages,  testMasks,  IMG_SIZE, USE_3CH);
+[X_train, y_train] = loadSet(trainImgList, trainMaskList, IMG_SIZE, USE_3CH);
+[X_val,   y_val  ] = loadSet(valImgList,   valMaskList,   IMG_SIZE, USE_3CH);
+[X_test,  y_test ] = loadSet(testImgList,  testMaskList,  IMG_SIZE, USE_3CH);
+
 
 fprintf(['Preprocessed:\n' ...
          '  Train X:%s  y:%s\n' ...
@@ -237,29 +236,30 @@ catch
 end
 fprintf('execution environment: %s\n', execEnv);
 
-%% Build pixel labels and datastores (SEGMENTATION-FRIENDLY)
+%% Build pixel labels and datastores for BCE+Dice regression loss
 
-% Class names (keep same order everywhere)
-classes = ["background","tumor"];
-Y_train_cat = categorical(y_train, [false true], classes);
-Y_val_cat   = categorical(y_val,   [false true], classes);
+% Convert binary masks to one-hot encoded format (H x W x 2 x N)
+% Channel 1 = background probabilities (1 where mask is 0)
+% Channel 2 = tumor probabilities (1 where mask is 1)
 
-Y_train_cat_2D = squeeze(Y_train_cat);   % HxWxN
-Y_val_cat_2D   = squeeze(Y_val_cat);
+Y_train_onehot = cat(3, ~y_train, y_train);  % [H x W x 2 x N]
+Y_val_onehot   = cat(3, ~y_val,   y_val);    % [H x W x 2 x N]
 
-imdsTrain = arrayDatastore(X_train,       'IterationDimension', 4);
-pxdsTrain = arrayDatastore(Y_train_cat_2D,'IterationDimension', 3);
+% Convert to single precision (continuous values 0.0 or 1.0)
+Y_train_onehot = single(Y_train_onehot);
+Y_val_onehot   = single(Y_val_onehot);
+
+% Create datastores
+imdsTrain = arrayDatastore(X_train,        'IterationDimension', 4);
+pxdsTrain = arrayDatastore(Y_train_onehot, 'IterationDimension', 4);
 dsTrain   = combine(imdsTrain, pxdsTrain);
 
-imdsVal = arrayDatastore(X_val,       'IterationDimension', 4);
-pxdsVal = arrayDatastore(Y_val_cat_2D,'IterationDimension', 3);
+imdsVal = arrayDatastore(X_val,        'IterationDimension', 4);
+pxdsVal = arrayDatastore(Y_val_onehot, 'IterationDimension', 4);
 dsVal   = combine(imdsVal, pxdsVal);
 
+fprintf('datastores created with one-hot encoded labels.\n');
 
-% Class weights (from your masks) to help imbalance
-tumorFrac = gather(nnz(y_train)) / numel(y_train);
-w = 1 ./ [max(1e-6,1-tumorFrac), max(1e-6,tumorFrac)];
-w = w / sum(w);
 
 % Define U-Net
 IMG_SIZE = size(X_train,1);
@@ -270,36 +270,52 @@ numClasses = 2;
 % Base network (use unetLayers because it returns a LayerGraph for trainNetwork)
 lgraph = unetLayers(imageSize, numClasses, 'EncoderDepth', 4);
 
-% Prefer Dice loss if available, else weighted CE
+% Find the existing pixel classification layer
 pxName = '';
 for L = 1:numel(lgraph.Layers)
-    if isa(lgraph.Layers(L),'nnet.cnn.layer.PixelClassificationLayer')
-        pxName = lgraph.Layers(L).Name; break;
+    if isa(lgraph.Layers(L), 'nnet.cnn.layer.PixelClassificationLayer') || ...
+       isa(lgraph.Layers(L), 'nnet.cnn.layer.DicePixelClassificationLayer')
+        pxName = lgraph.Layers(L).Name;
+        break;
     end
 end
 
-if exist('dicePixelClassificationLayer','file') == 2
-    % Dice loss helps with imbalance
-    newPx = dicePixelClassificationLayer('Name','labels', ...
-        'Classes',categorical(classes));
-else
-    % Weighted cross-entropy as fallback (heavy tumor weight)
-    newPx = pixelClassificationLayer('Name','labels', ...
-        'Classes',classes, 'ClassWeights',[0.2 0.8]);  % try [0.1 0.9] too
-end
+% Create the new combined BCE + Dice loss layer
+fprintf('Using combined BCE + Dice loss...\n');
+newPx = BCEDiceLossLayer('Name', pxName, ...
+    'BCEWeight', 1.0, ...
+    'DiceWeight', 1.0, ...
+    'Smooth', 1.0);
+
+% Replace the old loss layer with the new one
 lgraph = replaceLayer(lgraph, pxName, newPx);
 
+fprintf('Loss layer replaced successfully.\n');
+
+
+%% Training options - With LR sched
+fprintf('Configuring training options with LR schedule...\n');
 
 options = trainingOptions('adam', ...
-    'InitialLearnRate', 1e-3, ...
-    'MiniBatchSize', 8, ...
+    'InitialLearnRate', 5e-4, ...              % CHANGED: Lowered from 1e-3 to 5e-4
+    'LearnRateSchedule', 'piecewise', ...      % NEW: Add LR schedule
+    'LearnRateDropFactor', 0.5, ...            % NEW: Drop LR by 50% at each drop
+    'LearnRateDropPeriod', 10, ...             % NEW: Drop every 10 epochs
     'MaxEpochs', 30, ...
-    'Shuffle','every-epoch', ...
-    'ExecutionEnvironment','auto', ...
+    'MiniBatchSize', 8, ...
+    'Shuffle', 'every-epoch', ...
     'ValidationData', dsVal, ...
     'ValidationFrequency', 50, ...
-    'Verbose', false, ...
-    'Plots','training-progress');
+    'Verbose', true, ...
+    'Plots', 'training-progress', ...
+    'ExecutionEnvironment', 'auto');
+
+% learning rate schedule:
+% epochs 1-10:LR = 5e-4 (0.0005)
+% epochs 11-20:LR = 2.5e-4 (0.00025) - dropped by 0.5
+% eepochs 21-30:LR = 1.25e-4 (0.000125) - dropped by 0.5 again
+
+fprintf('Training configuration complete.\n');
 
 
 
@@ -307,89 +323,130 @@ options = trainingOptions('adam', ...
 net = trainNetwork(dsTrain, lgraph, options);   
 
 
-%% evaluate on the test set (Dice & IoU)
+
+%% Evaluate on the test set (Dice & IoU)
 fprintf('\nEvaluating on test set...\n');
-diceScores = zeros(1, numTest);
-iouScores  = zeros(1, numTest);
+numTest = size(X_test, 4);
+dice_all = zeros(1, numTest);
+iou_all  = zeros(1, numTest);
+dice_pos = [];
+iou_pos  = [];
 
 for i = 1:numTest
     I = X_test(:,:,:,i);
-    % predict categorical mask with class names matching "classes"
-    Yp = semanticseg(I, net, 'ExecutionEnvironment','auto');
-
-    % convert to logical for metrics: tumor=1, background=0
-    Mgt = y_test(:,:,1,i);   % logical ground truth
-    Mp  = (Yp == 'tumor');
-
-    % dice = 2TP/(2TP+FP+FN), IoU = TP/(TP+FP+FN)
-    tp  = nnz(Mp & Mgt);
-    fp  = nnz(Mp & ~Mgt);
-    fn  = nnz(~Mp & Mgt);
-    diceScores(i) = 2*tp / max(1, 2*tp + fp + fn);
-    iouScores(i)  = tp   / max(1, tp + fp + fn);
-end
-
-meanDice = mean(diceScores);
-meanIoU  = mean(iouScores);
-fprintf('mean dice: %.4f //// mean IoU: %.4f\n', meanDice, meanIoU);
-
-%% 7) Visualize a few predictions
-figure; 
-for k = 1:4
-    idx = randi(numTest);
-    I = X_test(:,:,:,idx);
-    Yp = semanticseg(I, net, 'ExecutionEnvironment','auto');
-    Mp = (Yp == 'tumor');
-
-    subplot(2,4,k);
-    imshow(I(:,:,min(C,2)),[]); title(sprintf('Test %d: Input (ch %d)', idx, min(C,2)));
-
-    subplot(2,4,k+4);
-    imshowpair(I(:,:,min(C,2)), Mp); title('Prediction overlay');
-end
-fprintf('\nEvaluating on test set...\n');
-numTest = size(X_test,4);
-dice_all = zeros(1,numTest); iou_all  = zeros(1,numTest);
-dice_pos = [];               iou_pos  = [];
-
-for i = 1:numTest
-    I  = X_test(:,:,:,i);
-    Yp = semanticseg(I, net, 'ExecutionEnvironment','auto');
-    Mp = (Yp=='tumor');
-    Mp = bwareaopen(Mp, 30);           % remove tiny specks
-    Mp = imfill(Mp, 'holes');          % fill small holes
-
-    Mgt = y_test(:,:,1,i);             % logical GT
-
-    tp = nnz(Mp & Mgt); fp = nnz(Mp & ~Mgt); fn = nnz(~Mp & Mgt);
-    dice_all(i) = 2*tp / max(1,2*tp+fp+fn);
-    iou_all(i)  = tp   / max(1,tp+fp+fn);
-
+    
+    % Use predict() instead of semanticseg() for regression output
+    % Output is [H x W x 2 x 1] where:
+    %   channel 1 = background probability
+    %   channel 2 = tumor probability
+    Yp_prob = predict(net, I, 'ExecutionEnvironment', 'auto');
+    
+    % Extract tumor probability (channel 2) and threshold at 0.5
+    tumor_prob = Yp_prob(:,:,2);
+    Mp = tumor_prob > 0.5;  % Binary prediction: 1 = tumor, 0 = background
+    
+    % Post-processing: remove small noise and fill holes
+    Mp = bwareaopen(Mp, 30);    % Remove tiny specks
+    Mp = imfill(Mp, 'holes');   % Fill small holes
+    
+    % Ground truth
+    Mgt = y_test(:,:,1,i);      % Logical ground truth
+    
+    % Calculate Dice and IoU
+    tp = nnz(Mp & Mgt);         % True positives
+    fp = nnz(Mp & ~Mgt);        % False positives
+    fn = nnz(~Mp & Mgt);        % False negatives
+    
+    dice_all(i) = 2*tp / max(1, 2*tp + fp + fn);
+    iou_all(i)  = tp   / max(1, tp + fp + fn);
+    
+    % Track metrics for tumor-present slices only
     if any(Mgt(:))
-        dice_pos(end+1) = dice_all(i);
-        iou_pos(end+1)  = iou_all(i);
+        dice_pos(end+1) = dice_all(i); %#ok<SAGROW>
+        iou_pos(end+1)  = iou_all(i);  %#ok<SAGROW>
     end
 end
 
+% Report results
+fprintf('\n========== TEST SET RESULTS ==========\n');
 fprintf('Overall Dice (all slices): %.4f | IoU: %.4f\n', mean(dice_all), mean(iou_all));
 fprintf('Dice (tumor slices only):  %.4f | IoU: %.4f | n=%d\n', ...
         mean(dice_pos), mean(iou_pos), numel(dice_pos));
 
-% Pixel accuracy (optional)
-acc_sum=0; pix_sum=0;
-for i=1:numTest
-    I  = X_test(:,:,:,i);
-    Yp = semanticseg(I, net, 'ExecutionEnvironment','auto');
-    pr = (Yp=='tumor'); gt = y_test(:,:,1,i);
-    acc_sum = acc_sum + nnz(pr==gt); pix_sum = pix_sum + numel(gt);
+% Pixel accuracy 
+acc_sum = 0;
+pix_sum = 0;
+for i = 1:numTest
+    I = X_test(:,:,:,i);
+    
+    % Predict
+    Yp_prob = predict(net, I, 'ExecutionEnvironment', 'auto');
+    Mp = Yp_prob(:,:,2) > 0.5;
+    
+    % Ground truth
+    Mgt = y_test(:,:,1,i);
+    
+    % Accumulate accuracy
+    acc_sum = acc_sum + nnz(Mp == Mgt);
+    pix_sum = pix_sum + numel(Mgt);
 end
-fprintf('Pixel accuracy on TEST: %.2f%% | Tumor pixel fraction: %.4f\n', ...
-        100*acc_sum/pix_sum, nnz(y_test)/numel(y_test));
 
+fprintf('Pixel accuracy on TEST: %.2f%%\n', 100 * acc_sum / pix_sum);
+fprintf('Tumor pixel fraction: %.4f\n', nnz(y_test) / numel(y_test));
+fprintf('======================================\n\n');
+
+
+%% Visualize a few predictions
+fprintf('Generating visualization...\n');
+figure('Name', 'Test Set Predictions', 'NumberTitle', 'off');
+
+for k = 1:min(4, numTest)
+    % Pick a random test image
+    idx = randi(numTest);
+    I = X_test(:,:,:,idx);
+    
+    % Predict
+    Yp_prob = predict(net, I, 'ExecutionEnvironment', 'auto');
+    Mp = Yp_prob(:,:,2) > 0.5;
+    Mp = bwareaopen(Mp, 30);
+    Mp = imfill(Mp, 'holes');
+    
+    % Ground truth
+    Mgt = y_test(:,:,1,idx);
+    
+    % Display input image (use FLAIR channel if 3-channel)
+    subplot(3, 4, k);
+    if C == 3
+        imshow(I(:,:,2), []); % FLAIR channel
+    else
+        imshow(I(:,:,1), []);
+    end
+    title(sprintf('Test %d: Input', idx));
+    
+    % Display ground truth
+    subplot(3, 4, k + 4);
+    imshowpair(I(:,:,min(C,2)), Mgt);
+    title('Ground Truth');
+    
+    % Display prediction overlay
+    subplot(3, 4, k + 8);
+    imshowpair(I(:,:,min(C,2)), Mp);
+    title(sprintf('Prediction (Dice: %.3f)', dice_all(idx)));
+end
+
+fprintf('Visualization complete.\n');
+
+%%
+classes = ["background","tumor"];
+
+fprintf('Saving results...\n');
 save('week3_4_trained_unet.mat', ...
      'net','options','lgraph','imageSize','classes','USE_3CH', ...
      'dice_all','iou_all','dice_pos','iou_pos','-v7.3');
- function [XB, YB] = balanceWithAug(X, Y, S)
+
+
+
+function [XB, YB] = balanceWithAug(X, Y, S)
 % Oversample minority class with paired augmentation (flip/rotate/scale/noise).
 % Works for X with C = 1 or 3 channels; Y is single-channel logical.
 
